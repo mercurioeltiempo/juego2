@@ -1,2 +1,582 @@
-# juego2
-variado
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>MANSION — RE1 PS1 Style</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; display:flex; align-items:center; justify-content:center; height:100vh; overflow:hidden; }
+  #container { position:relative; width:640px; height:480px; }
+
+  /* Low-res canvas escalado = efecto PS1 */
+  #cv {
+    width:640px; height:480px;
+    display:block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+
+  /* Scanlines CRT */
+  #scanlines {
+    position:absolute; inset:0; pointer-events:none;
+    background: repeating-linear-gradient(
+      to bottom,
+      transparent, transparent 2px,
+      rgba(0,0,0,0.25) 2px, rgba(0,0,0,0.25) 4px
+    );
+  }
+
+  /* Viñeta */
+  #vignette {
+    position:absolute; inset:0; pointer-events:none;
+    background: radial-gradient(ellipse at 50% 50%, transparent 45%, rgba(0,0,0,0.75) 100%);
+  }
+
+  /* HUD */
+  #hud {
+    position:absolute; bottom:10px; left:0; right:0;
+    display:flex; justify-content:space-between; padding:0 12px;
+    pointer-events:none;
+  }
+  #hud span {
+    font-family: 'Courier New', monospace;
+    font-size:10px; letter-spacing:2px;
+    color:#8aaa88; text-shadow:0 0 4px #4a6a48;
+  }
+
+  /* Zona hint */
+  #zonelabel {
+    position:absolute; top:10px; left:50%; transform:translateX(-50%);
+    font-family:'Courier New',monospace; font-size:9px; letter-spacing:3px;
+    color:#6a8868; opacity:0; transition:opacity .5s;
+    pointer-events:none;
+  }
+</style>
+</head>
+<body>
+<div id="container">
+  <canvas id="cv"></canvas>
+  <div id="scanlines"></div>
+  <div id="vignette"></div>
+  <div id="hud">
+    <span id="camLabel">CAM 1</span>
+    <span>WASD · MOVER</span>
+    <span id="zoneLabel">ENTRADA</span>
+  </div>
+  <div id="zonelabel" id="zoneFlash"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+'use strict';
+
+// ─────────────────────────────────────────────
+// RENDERER — baja resolución intencionada (PS1)
+// ─────────────────────────────────────────────
+const canvas = document.getElementById('cv');
+const RW = 320, RH = 240; // resolución interna PS1
+canvas.width  = RW;
+canvas.height = RH;
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:false });
+renderer.setPixelRatio(1);
+renderer.setSize(RW, RH, false);
+renderer.setClearColor(0x000000, 1);
+
+// ─────────────────────────────────────────────
+// SCENE
+// ─────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+scene.fog = new THREE.Fog(0x0a0c08, 6, 22);
+
+// ─────────────────────────────────────────────
+// TEXTURAS PROCEDURALES (canvas, sin red)
+// ─────────────────────────────────────────────
+function makeTexture(size, drawFn){
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  drawFn(c.getContext('2d'), size);
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.NearestFilter;
+  t.minFilter = THREE.NearestFilter;
+  return t;
+}
+
+// Piso — tablones de madera oscura
+const floorTex = makeTexture(128, (ctx, s)=>{
+  ctx.fillStyle = '#1a1208';
+  ctx.fillRect(0,0,s,s);
+  const plankW = 16;
+  for(let x=0;x<s;x+=plankW){
+    // borde de tablón
+    ctx.fillStyle = '#0d0a04';
+    ctx.fillRect(x,0,1,s);
+    // veta de madera
+    for(let y=0;y<s;y+=3){
+      const v = Math.random();
+      if(v>0.7){
+        ctx.fillStyle = `rgba(30,20,8,${Math.random()*0.4})`;
+        ctx.fillRect(x+1, y, plankW-2, 1+Math.floor(Math.random()*2));
+      }
+    }
+  }
+  // líneas horizontales entre tablas
+  for(let y=0;y<s;y+=32){
+    ctx.fillStyle='#0a0804';
+    ctx.fillRect(0,y,s,1);
+  }
+});
+
+// Pared — piedra gótica
+const wallTex = makeTexture(128, (ctx, s)=>{
+  ctx.fillStyle = '#161410';
+  ctx.fillRect(0,0,s,s);
+  const bW=32, bH=16;
+  for(let row=0;row<s/bH;row++){
+    const offset = (row%2===0)?0:bW/2;
+    for(let col=-1;col<s/bW+1;col++){
+      const x = col*bW + offset;
+      const y = row*bH;
+      // bloque
+      const shade = 14+Math.floor(Math.random()*8);
+      ctx.fillStyle = `rgb(${shade},${shade-2},${shade-4})`;
+      ctx.fillRect(x+1, y+1, bW-2, bH-2);
+      // mortero oscuro
+      ctx.fillStyle='#080806';
+      ctx.fillRect(x,y,bW,1);
+      ctx.fillRect(x,y,1,bH);
+    }
+  }
+  // manchas de humedad
+  for(let i=0;i<12;i++){
+    ctx.fillStyle=`rgba(0,0,0,${0.1+Math.random()*0.2})`;
+    ctx.fillRect(Math.random()*s,Math.random()*s,2+Math.random()*6,2+Math.random()*6);
+  }
+});
+
+// Techo — vigas de madera
+const ceilTex = makeTexture(128, (ctx, s)=>{
+  ctx.fillStyle='#0d0c0a';
+  ctx.fillRect(0,0,s,s);
+  for(let x=0;x<s;x+=24){
+    ctx.fillStyle='#181210';
+    ctx.fillRect(x,0,10,s);
+    ctx.fillStyle='#0a0908';
+    ctx.fillRect(x,0,1,s);
+    ctx.fillRect(x+10,0,1,s);
+  }
+  for(let y=0;y<s;y+=32){
+    ctx.fillStyle='#0f0e0c';
+    ctx.fillRect(0,y,s,4);
+  }
+});
+
+// ─────────────────────────────────────────────
+// MATERIALES
+// ─────────────────────────────────────────────
+function mat(texture, col){
+  const m = new THREE.MeshPhongMaterial({
+    map: texture||null,
+    color: col||0xffffff,
+    flatShading: true,
+    shininess: 0
+  });
+  return m;
+}
+
+const mFloor  = mat(floorTex);
+const mWall   = mat(wallTex);
+const mCeil   = mat(ceilTex);
+const mWood   = mat(null, 0x1a1208);
+const mMetal  = mat(null, 0x181a16);
+const mShadow = new THREE.MeshBasicMaterial({color:0x000000, transparent:true, opacity:0.6});
+const mHalo   = new THREE.MeshBasicMaterial({color:0x3a5a38, transparent:true, opacity:0.35, depthWrite:false});
+
+// Velas — emisivos
+const mFlame  = new THREE.MeshBasicMaterial({color:0xcc6600});
+const mCandle = mat(null, 0x2a2218);
+
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+function add(m){ scene.add(m); return m; }
+
+function box(w,h,d, material, x,y,z, ry=0){
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), material);
+  m.position.set(x,y,z);
+  m.rotation.y = ry;
+  return add(m);
+}
+
+function plane(w,d, material, x,y,z, rx=0, ry=0){
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w,d), material);
+  m.position.set(x,y,z);
+  m.rotation.x=rx; m.rotation.y=ry;
+  return add(m);
+}
+
+// ─────────────────────────────────────────────
+// MUNDO — MANSIÓN (2 salas conectadas)
+// ─────────────────────────────────────────────
+
+const ROOM_W = 10, ROOM_D = 12, WALL_H = 4;
+
+// === SALA 1: ENTRADA ===
+// Piso
+plane(ROOM_W, ROOM_D, mFloor, 0, 0, 0, -Math.PI/2);
+// Techo
+plane(ROOM_W, ROOM_D, mCeil,  0, WALL_H, 0, Math.PI/2);
+// Paredes
+plane(ROOM_W, WALL_H, mWall, 0, WALL_H/2, -ROOM_D/2);           // Norte
+plane(ROOM_W, WALL_H, mWall, 0, WALL_H/2,  ROOM_D/2, 0, Math.PI); // Sur
+plane(ROOM_D, WALL_H, mWall, -ROOM_W/2, WALL_H/2, 0, 0, Math.PI/2);  // Oeste
+// Pared Este — con hueco de puerta hacia sala 2
+plane(ROOM_D/2-0.5, WALL_H, mWall, ROOM_W/2, WALL_H/2, -ROOM_D/4-0.25, 0, -Math.PI/2);
+plane(ROOM_D/2-0.5, WALL_H, mWall, ROOM_W/2, WALL_H/2,  ROOM_D/4+0.25, 0, -Math.PI/2);
+// Franja sobre puerta
+plane(2, WALL_H*0.35, mWall, ROOM_W/2, WALL_H*0.82, 0, 0, -Math.PI/2);
+
+// === SALA 2: BIBLIOTECA ===
+const S2X = ROOM_W + 1; // offset X sala 2
+plane(ROOM_W, ROOM_D, mFloor, S2X, 0, 0, -Math.PI/2);
+plane(ROOM_W, ROOM_D, mCeil,  S2X, WALL_H, 0, Math.PI/2);
+plane(ROOM_W, WALL_H, mWall,  S2X, WALL_H/2, -ROOM_D/2);
+plane(ROOM_W, WALL_H, mWall,  S2X, WALL_H/2,  ROOM_D/2, 0, Math.PI);
+plane(ROOM_D, WALL_H, mWall,  S2X+ROOM_W/2, WALL_H/2, 0, 0, -Math.PI/2);
+// Pared Oeste sala2 (misma que Este sala1 — ya existe)
+
+// Franja conexión — suelo corredor
+plane(1, ROOM_D*0.4, mFloor, ROOM_W/2+0.5, 0, 0, -Math.PI/2);
+
+// === MOBILIARIO SALA 1 ===
+// Escalera (lateral)
+for(let i=0;i<5;i++){
+  box(1.8, 0.15, 0.8, mWood, -ROOM_W/2+0.9+i*0.15, 0.15+i*0.38, -ROOM_D/2+0.8+i*0.7, -0.05);
+}
+// Barandilla
+box(0.08, 2.2, 0.08, mMetal, -ROOM_W/2+1.8, 1.1, -ROOM_D/2+0.4);
+box(0.08, 2.2, 0.08, mMetal, -ROOM_W/2+1.8, 1.1, -ROOM_D/2+3.2);
+box(2.0, 0.08, 0.08, mMetal, -ROOM_W/2+1.8, 2.2, -ROOM_D/2+1.8);
+
+// Mesa central sala 1
+box(2.2, 0.1, 1.0, mWood, 1, 0.82, 1);
+box(0.1, 0.82, 0.1, mWood, 0.0, 0.41, 0.55);
+box(0.1, 0.82, 0.1, mWood, 2.0, 0.41, 0.55);
+box(0.1, 0.82, 0.1, mWood, 0.0, 0.41, 1.45);
+box(0.1, 0.82, 0.1, mWood, 2.0, 0.41, 1.45);
+
+// Silla
+box(0.7,0.06,0.7, mWood,  3, 0.5, 0.5);
+box(0.06,0.5,0.06,mWood,  2.7,0.25,0.2);
+box(0.06,0.5,0.06,mWood,  3.3,0.25,0.2);
+box(0.06,0.5,0.06,mWood,  2.7,0.25,0.8);
+box(0.06,0.5,0.06,mWood,  3.3,0.25,0.8);
+box(0.7, 0.7, 0.06,mWood, 3, 0.85, 0.17);
+
+// Armario en pared norte
+box(1.4, 2.8, 0.5, mWood, -3, 1.4, -ROOM_D/2+0.3);
+box(1.4, 0.05,0.5, mWood, -3, 2.8, -ROOM_D/2+0.3);
+// Detalle puerta armario
+box(0.02,2.5,0.45, mMetal, -3.65,1.4,-ROOM_D/2+0.3);
+
+// Cuadro en pared
+box(0.04, 0.9, 0.7, mMetal, ROOM_W/2-0.03, 2.4, -2);
+
+// Alfombra oscura
+plane(3.5, 2.5, new THREE.MeshBasicMaterial({color:0x1a0a08, transparent:true, opacity:0.85}), 1,0.01,1,-Math.PI/2);
+
+// === MOBILIARIO SALA 2 ===
+// Estanterías
+for(let s=0;s<3;s++){
+  const sz = -ROOM_D/2+1.5+s*3;
+  box(0.2, 2.8, 1.6, mWood, S2X+ROOM_W/2-0.15, 1.4, sz);
+  // libros (cajas pequeñas de distintos tamaños)
+  for(let b=0;b<5;b++){
+    const bh = 0.3+Math.random()*0.25;
+    box(0.18, bh, 0.24+Math.random()*0.12,
+      new THREE.MeshPhongMaterial({color:new THREE.Color().setHSL(Math.random()*.15+.05, 0.3, 0.12+Math.random()*.08), flatShading:true}),
+      S2X+ROOM_W/2-0.15, 0.5+bh/2+Math.floor(b/3)*0.55, sz-0.5+b*0.25
+    );
+  }
+}
+
+// Mesa larga biblioteca
+box(3.0, 0.1, 1.2, mWood, S2X-0.5, 0.82, 0.5);
+box(0.1,0.82,0.1,mWood,S2X-1.9,0.41,0);
+box(0.1,0.82,0.1,mWood,S2X+0.9,0.41,0);
+box(0.1,0.82,0.1,mWood,S2X-1.9,0.41,1);
+box(0.1,0.82,0.1,mWood,S2X+0.9,0.41,1);
+
+// Candelabro central
+box(0.06,1.4,0.06,mMetal, S2X-0.5, WALL_H-0.7, 0);
+box(0.5,0.04,0.5,mMetal,  S2X-0.5, WALL_H-1.4, 0);
+
+// === VELAS (luz + geometría) ===
+const candleDefs = [
+  {x:-2.5, z:-4.5, room:0},
+  {x: 2.8, z: 3.8, room:0},
+  {x:-4.0, z: 2.0, room:0},
+  {x:S2X-0.5, z:0, room:1},    // candelabro
+  {x:S2X+3.5, z:-4, room:1},
+  {x:S2X-3.5, z: 4, room:1},
+];
+
+const candles = [];
+candleDefs.forEach(c=>{
+  // cuerpo vela
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(.04,.05,.3,6), mCandle);
+  body.position.set(c.x, .15, c.z);
+  add(body);
+  // llama
+  const flame = new THREE.Mesh(new THREE.ConeGeometry(.035,.09,5), mFlame);
+  flame.position.set(c.x, .36, c.z);
+  add(flame);
+  // luz puntual — suave, color cálido apagado
+  const light = new THREE.PointLight(0x8a5a20, 1.2, 4.5);
+  light.position.set(c.x, .5, c.z);
+  add(light);
+  candles.push({light, flame, baseInt:1.2, phase:Math.random()*Math.PI*2, px:c.x, pz:c.z});
+});
+
+// === ILUMINACIÓN BASE ===
+// Muy tenue — casi todo viene de las velas
+scene.add(new THREE.AmbientLight(0x0a0d08, 1.8));
+
+// Luz tenue desde arriba (simula luna lejana por ventana)
+const moonLight = new THREE.DirectionalLight(0x1a2018, 0.4);
+moonLight.position.set(-3, 8, -5);
+scene.add(moonLight);
+
+// ─────────────────────────────────────────────
+// PERSONAJE
+// ─────────────────────────────────────────────
+const charGroup = new THREE.Group();
+
+// Cuerpo
+const torso = new THREE.Mesh(
+  new THREE.BoxGeometry(0.34, 0.44, 0.2),
+  new THREE.MeshPhongMaterial({color:0x1a1a1a, flatShading:true})
+);
+torso.position.y = 0.72;
+charGroup.add(torso);
+
+// Cabeza
+const head = new THREE.Mesh(
+  new THREE.BoxGeometry(0.22, 0.22, 0.2),
+  new THREE.MeshPhongMaterial({color:0x1e1a14, flatShading:true})
+);
+head.position.y = 1.06;
+charGroup.add(head);
+
+// Piernas
+[-0.1, 0.1].forEach(ox=>{
+  const leg = new THREE.Mesh(
+    new THREE.BoxGeometry(0.13, 0.38, 0.16),
+    new THREE.MeshPhongMaterial({color:0x141414, flatShading:true})
+  );
+  leg.position.set(ox, 0.31, 0);
+  charGroup.add(leg);
+});
+
+// Brazos
+[-0.24, 0.24].forEach(ox=>{
+  const arm = new THREE.Mesh(
+    new THREE.BoxGeometry(0.1, 0.36, 0.14),
+    new THREE.MeshPhongMaterial({color:0x181818, flatShading:true})
+  );
+  arm.position.set(ox, 0.72, 0);
+  charGroup.add(arm);
+});
+
+// Halo en suelo
+const haloGeo = new THREE.CircleGeometry(0.45, 16);
+const halo = new THREE.Mesh(haloGeo, mHalo);
+halo.rotation.x = -Math.PI/2;
+halo.position.y = 0.005;
+charGroup.add(halo);
+
+add(charGroup);
+
+// Luz del personaje (linterna débil)
+const charLight = new THREE.PointLight(0x6a7a60, 1.8, 5.5);
+charLight.position.y = 0.9;
+charGroup.add(charLight);
+
+// ─────────────────────────────────────────────
+// CÁMARAS — estilo RE1 (fijas por zona)
+// ─────────────────────────────────────────────
+// Cada zona tiene: bounds (x1,z1,x2,z2), cámara, label
+const zones = [
+  {
+    bounds: {x1:-5, z1:-6, x2: 5.2, z2:6},
+    label: 'ENTRADA',
+    cam: (()=>{
+      const c = new THREE.PerspectiveCamera(58, RW/RH, 0.1, 30);
+      c.position.set(-3.5, 5.5, 8);
+      c.lookAt(0.5, 0.5, 0);
+      return c;
+    })()
+  },
+  {
+    bounds: {x1:-5, z1:-6, x2: 5.2, z2:6},
+    label: 'ENTRADA',
+    cam: (()=>{
+      const c = new THREE.PerspectiveCamera(55, RW/RH, 0.1, 30);
+      c.position.set(4.5, 3.8, -7.5);
+      c.lookAt(-0.5, 1, 1);
+      return c;
+    })()
+  },
+  {
+    bounds: {x1: 5.2, z1:-6, x2:16, z2:6},
+    label: 'BIBLIOTECA',
+    cam: (()=>{
+      const c = new THREE.PerspectiveCamera(60, RW/RH, 0.1, 30);
+      c.position.set(S2X+4, 5, 8.5);
+      c.lookAt(S2X, 0.8, 0);
+      return c;
+    })()
+  },
+  {
+    bounds: {x1: 5.2, z1:-6, x2:16, z2:6},
+    label: 'BIBLIOTECA',
+    cam: (()=>{
+      const c = new THREE.PerspectiveCamera(52, RW/RH, 0.1, 30);
+      c.position.set(S2X-5, 3.5, -7);
+      c.lookAt(S2X, 1, 0);
+      return c;
+    })()
+  },
+];
+
+// Determinar zona activa por posición del jugador
+function getZone(px, pz){
+  // Sala 2
+  if(px > 5.2) return Math.abs(pz) < 3 ? 2 : 3;
+  // Sala 1 — ángulo según posición
+  if(pz < 0) return 0;
+  return 1;
+}
+
+let activeZone  = 0;
+let activeLabel = 'ENTRADA';
+
+// ─────────────────────────────────────────────
+// INPUT
+// ─────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e=>{
+  keys[e.code] = true;
+  e.preventDefault();
+});
+document.addEventListener('keyup', e=>{ keys[e.code] = false; });
+
+// ─────────────────────────────────────────────
+// ESTADO JUGADOR
+// ─────────────────────────────────────────────
+const player = { x:0, z:0, ry:0 };
+const SPEED  = 3.0;
+
+// Límites por sala
+const BOUNDS = [
+  {x1:-4.6, z1:-5.5, x2:5.0, z2:5.5},   // sala 1
+  {x1: 5.5, z1:-5.5, x2:15.5, z2:5.5},  // sala 2
+];
+
+function clampPlayer(){
+  // permitir pasar por el corredor
+  if(player.x >= 4.8 && player.x <= 6.0 && Math.abs(player.z) < 1.2) return;
+  // sala 1
+  if(player.x < 5.5){
+    player.x = Math.max(-4.6, Math.min(5.0, player.x));
+    player.z = Math.max(-5.5, Math.min(5.5, player.z));
+  } else {
+    player.x = Math.max(5.5, Math.min(15.5, player.x));
+    player.z = Math.max(-5.5, Math.min(5.5, player.z));
+  }
+}
+
+// Animación piernas
+let stepT = 0;
+let isMoving = false;
+
+// ─────────────────────────────────────────────
+// LOOP
+// ─────────────────────────────────────────────
+const clock = new THREE.Clock();
+let t = 0;
+
+const camLabel   = document.getElementById('camLabel');
+const zoneLabel  = document.getElementById('zoneLabel');
+
+function frame(){
+  requestAnimationFrame(frame);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  t += dt;
+
+  // ── Movimiento relativo a la cámara activa ──
+  const cam = zones[activeZone].cam;
+  const fwd = new THREE.Vector3();
+  cam.getWorldDirection(fwd); fwd.y=0; fwd.normalize();
+  const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0,1,0)).normalize();
+
+  const mv = new THREE.Vector3();
+  if(keys['KeyW']||keys['ArrowUp'])    mv.addScaledVector(fwd,   1);
+  if(keys['KeyS']||keys['ArrowDown'])  mv.addScaledVector(fwd,  -1);
+  if(keys['KeyA']||keys['ArrowLeft'])  mv.addScaledVector(right,-1);
+  if(keys['KeyD']||keys['ArrowRight']) mv.addScaledVector(right, 1);
+
+  isMoving = mv.length() > 0;
+  if(isMoving){
+    mv.normalize().multiplyScalar(SPEED * dt);
+    player.x += mv.x;
+    player.z += mv.z;
+    clampPlayer();
+    // Rotar personaje hacia dirección de movimiento
+    player.ry = Math.atan2(mv.x, mv.z);
+    stepT += dt * 8;
+  }
+
+  // ── Posicionar personaje ──
+  charGroup.position.set(player.x, 0, player.z);
+  charGroup.rotation.y = player.ry;
+
+  // Animación piernas (bob)
+  if(isMoving){
+    charGroup.children[2].position.y = 0.31 + Math.sin(stepT)*0.06;
+    charGroup.children[3].position.y = 0.31 - Math.sin(stepT)*0.06;
+    charGroup.children[0].position.y = 0.72 + Math.abs(Math.sin(stepT))*0.02;
+    charGroup.children[4].rotation.x =  Math.sin(stepT)*0.3;
+    charGroup.children[5].rotation.x = -Math.sin(stepT)*0.3;
+  }
+
+  // ── Zona y cámara ──
+  const newZone = getZone(player.x, player.z);
+  if(newZone !== activeZone){
+    activeZone = newZone;
+    activeLabel = zones[activeZone].label;
+    camLabel.textContent  = `CAM ${activeZone+1}`;
+    zoneLabel.textContent = activeLabel;
+  }
+
+  // ── Velas — parpadeo suave ──
+  candles.forEach(c=>{
+    const flicker = c.baseInt * (0.7 + Math.sin(t*4.5 + c.phase)*0.2 + Math.sin(t*11.3+c.phase*2)*0.1);
+    c.light.intensity = Math.max(0, flicker + (Math.random()<.005 ? -flicker*.5 : 0));
+    // llama — escala Y según parpadeo
+    c.flame.scale.y = 0.85 + Math.sin(t*6+c.phase)*0.18;
+    c.flame.rotation.y = t*1.5 + c.phase;
+  });
+
+  // ── Render ──
+  renderer.render(scene, zones[activeZone].cam);
+}
+
+frame();
+
+})();
+</script>
+</body>
+</html>
